@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -44,7 +45,24 @@ POOLS_DATA_DIR = DATA_DIR / "pools"
 SHARED_FILE = DATA_DIR / "shared.json"
 PREDICTIONS_FILE = DATA_DIR / "predictions.json"
 POOLS_CONFIG_FILE = ROOT / "pools.json"
-REQUEST_DELAY_SECONDS = 0.3
+# Per-WORKER courtesy delay between requests. The per-user endpoints are
+# fetched by MAX_WORKERS threads in parallel, so the aggregate request rate
+# is roughly MAX_WORKERS / (delay + round-trip time) -- about 10-15 req/s
+# with these values, comparable to one Gamecenter page load.
+REQUEST_DELAY_SECONDS = 0.1
+MAX_WORKERS = 6
+
+# One shared session so connections (TCP + TLS) are reused across the
+# ~1500 requests of a full scrape instead of re-handshaking every call --
+# this alone is a multi-x speedup. urllib3's pool manager is thread-safe,
+# so the worker threads can share it.
+SESSION = requests.Session()
+SESSION.mount(
+    "https://",
+    requests.adapters.HTTPAdapter(
+        pool_connections=MAX_WORKERS * 2, pool_maxsize=MAX_WORKERS * 2
+    ),
+)
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -149,17 +167,29 @@ MAX_RETRIES = 3
 def get_json(url: str, headers: dict):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = requests.get(url, headers=headers, timeout=30)
+            response = SESSION.get(url, headers=headers, timeout=30)
         except requests.exceptions.RequestException as exc:
-            # Scrapes now run 50+ unique users over many minutes -- a
-            # transient connection reset shouldn't blow away that whole
-            # run, so retry a couple of times with backoff before giving up.
+            # Scrapes cover 50+ unique users -- a transient connection reset
+            # shouldn't blow away that whole run, so retry a couple of times
+            # with backoff before giving up.
             if attempt == MAX_RETRIES:
                 raise
-            wait = REQUEST_DELAY_SECONDS * (2**attempt)
+            wait = 2**attempt
             log.warning(
                 "Request failed (%s), retrying in %.1fs (attempt %d/%d): %s",
                 exc, wait, attempt, MAX_RETRIES, url,
+            )
+            time.sleep(wait)
+            continue
+
+        # Now that requests run concurrently, back off politely if Scorito
+        # ever throttles or hiccups instead of failing the whole scrape.
+        if response.status_code in (429, 503) and attempt < MAX_RETRIES:
+            retry_after = response.headers.get("Retry-After", "")
+            wait = float(retry_after) if retry_after.isdigit() else float(2**attempt)
+            log.warning(
+                "Got %d, backing off %.1fs (attempt %d/%d): %s",
+                response.status_code, wait, attempt, MAX_RETRIES, url,
             )
             time.sleep(wait)
             continue
@@ -214,6 +244,21 @@ def get_json_any_version(
             version_cache[cache_key] = version
             return content
     return []
+
+
+def map_participants(participants: list[dict], worker) -> list:
+    """Run `worker(participant)` across a small thread pool and flatten the
+    per-user result lists, preserving participant order (so output files stay
+    deterministic run-to-run).
+
+    Per-user endpoint calls dominate the scrape (~25 requests x 50+ users);
+    running them sequentially with a courtesy delay is what used to make a
+    full scrape take 1.5 hours. Each user's own requests stay sequential
+    within one worker, so the per-user version_cache entry is only ever
+    touched by one thread at a time.
+    """
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        return [row for rows in pool.map(worker, participants) for row in rows]
 
 
 def round_id_for_order(cfg: Config, order: int) -> int:
@@ -342,18 +387,19 @@ def fetch_predictions(
     version_cache: dict,
 ) -> list[dict]:
     round_ids = sorted({round_id_for_order(cfg, order) for order in round_orders})
-    predictions = []
+    headers = cfg.headers()
 
-    for participant in participants:
+    def for_user(participant: dict) -> list[dict]:
         user_id = participant["userId"]
+        rows = []
         for round_id in round_ids:
             url = (
                 "https://ftm-prediction-query.scorito.com/{version}/v1.0/matchprediction/"
                 f"{round_id}/{user_id}"
             )
-            content = get_json_any_version(url, cfg.headers(), version_cache, user_id)
+            content = get_json_any_version(url, headers, version_cache, user_id)
             for p in content:
-                predictions.append(
+                rows.append(
                     {
                         "userId": p["userId"],
                         "userName": participant["userName"],
@@ -363,6 +409,9 @@ def fetch_predictions(
                         "dateTimePredicted": p["dateTimePredicted"],
                     }
                 )
+        return rows
+
+    predictions = map_participants(participants, for_user)
 
     log.info(
         "Collected %d predictions across %d participants",
@@ -379,26 +428,27 @@ def fetch_topscorer_predictions(
     picks can change every round (topscorer id = topscorer_id_offset + tier,
     the same 1-6 tier scheme as match points)."""
     tiers = sorted({ROUND_TIER[order] for order in round_orders})
-    predictions = []
+    headers = cfg.headers()
 
-    for tier in tiers:
-        topscorer_id = cfg.topscorer_id_offset + tier
-        for participant in participants:
-            user_id = participant["userId"]
+    def for_user(participant: dict) -> list[dict]:
+        user_id = participant["userId"]
+        rows = []
+        for tier in tiers:
+            topscorer_id = cfg.topscorer_id_offset + tier
             url = (
                 "https://ftm-prediction-query.scorito.com/{version}/v1.0/topscorerprediction/"
                 f"{topscorer_id}/{user_id}"
             )
             content = get_json_any_version(
                 url,
-                cfg.headers(),
+                headers,
                 version_cache,
                 user_id,
                 is_valid=lambda c: bool(c.get("teamPlayerEnrichedIds")) if c else False,
             )
             if not content:
                 continue
-            predictions.append(
+            rows.append(
                 {
                     "userId": content["userId"],
                     "userName": participant["userName"],
@@ -408,6 +458,9 @@ def fetch_topscorer_predictions(
                     "dateTimePredicted": content["dateTimePredicted"],
                 }
             )
+        return rows
+
+    predictions = map_participants(participants, for_user)
 
     log.info(
         "Collected %d topscorer predictions across %d round tiers",
@@ -502,31 +555,32 @@ def fetch_champion_predictions(
     cfg: Config, participants: list[dict], version_cache: dict
 ) -> list[dict]:
     """Each user's one-time pick for the tournament winner (resolves at the final)."""
-    predictions = []
+    headers = cfg.headers()
 
-    for participant in participants:
-        user_id = participant["userId"]
+    def for_user(participant: dict) -> list[dict]:
         url = (
             "https://ftm-prediction-query.scorito.com/{version}/v1.0/championprediction/"
-            f"{cfg.market_id}/{user_id}"
+            f"{cfg.market_id}/{participant['userId']}"
         )
         content = get_json_any_version(
             url,
-            cfg.headers(),
+            headers,
             version_cache,
-            user_id,
+            participant["userId"],
             is_valid=lambda c: bool(c.get("teamId")) if c else False,
         )
         if not content:
-            continue
-        predictions.append(
+            return []
+        return [
             {
                 "userId": content["userId"],
                 "userName": participant["userName"],
                 "teamId": content["teamId"],
                 "dateTimePredicted": content["dateTimePredicted"],
             }
-        )
+        ]
+
+    predictions = map_participants(participants, for_user)
 
     log.info("Collected %d champion predictions", len(predictions))
     return predictions
@@ -537,28 +591,31 @@ def fetch_round_scores(
 ) -> list[dict]:
     """Per-round points per participant, for a cumulative 'line race' chart."""
     round_ids = sorted({round_id_for_order(cfg, order) for order in round_orders})
-    scores = []
+    headers = cfg.headers()
 
-    for round_id in round_ids:
-        round_name = round_label_for_id(cfg, round_id)
-        for participant in participants:
+    def for_user(participant: dict) -> list[dict]:
+        rows = []
+        for round_id in round_ids:
             url = (
                 "https://ranking.scorito.com/3/ranking/v2.0/scoreblock/userscore/"
                 f"{cfg.market_id}/{round_id}/{participant['userId']}"
             )
-            content = get_json(url, cfg.headers())
+            content = get_json(url, headers)
             if not content:
                 continue
-            scores.append(
+            rows.append(
                 {
                     "userId": participant["userId"],
                     "userName": participant["userName"],
                     "roundId": round_id,
-                    "roundName": round_name,
+                    "roundName": round_label_for_id(cfg, round_id),
                     "points": content.get("Points"),
                     "betterThanPercentage": content.get("BetterThanPercentage"),
                 }
             )
+        return rows
+
+    scores = map_participants(participants, for_user)
 
     log.info("Collected %d round scores", len(scores))
     return scores
