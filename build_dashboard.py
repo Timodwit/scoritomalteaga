@@ -114,7 +114,19 @@ def build_pool_payload(pool_meta: dict, roster: list[dict], d: dict, preds: dict
             for uid, gain in gains.items()
             if gain == best and best > 0
         ]
-        round_winners.append({"roundName": round_name, "winnerNames": winners, "points": best})
+        ranking = sorted(
+            (
+                {"userName": computed_by_user[uid]["userName"], "points": gain}
+                for uid, gain in gains.items()
+            ),
+            key=lambda r: r["points"],
+            reverse=True,
+        )
+        for i, r in enumerate(ranking, 1):
+            r["rank"] = i
+        round_winners.append(
+            {"roundName": round_name, "winnerNames": winners, "points": best, "ranking": ranking}
+        )
 
     leader = participants[0]
 
