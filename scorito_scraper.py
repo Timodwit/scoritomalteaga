@@ -21,6 +21,7 @@ Writes:
 - data/pools/{slug}.json -> one file per poule: its own roster (userId,
                             name, rank, totalPoints within that poule)
 """
+import argparse
 import json
 import logging
 import os
@@ -28,6 +29,7 @@ import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -93,6 +95,17 @@ ROUND_NAMES = {
 }
 
 GOAL_EVENT_TYPE = 1
+
+# Match Status values, derived empirically from the schema data: 0 =
+# scheduled (also for TBD knockout slots), 2 = finished (every match with
+# goals/results has it). Anything in between means in progress.
+MATCH_STATUS_FINISHED = 2
+
+# How long after kickoff a match still counts as possibly-live. Knockout
+# games can run to extra time + penalties (~2h45 of play), so 3.5 hours is
+# comfortably past any real match. This is only a safety cap: normally the
+# Status flip to finished ends the live window well before this.
+LIVE_WINDOW = timedelta(hours=3.5)
 
 # The pool's point table scales 1x/2x/3x/4x/5x/6x from the group-stage base
 # across group/R32/R16/QF/SF/final+3rd -- both match-point tiers AND, as
@@ -621,6 +634,120 @@ def fetch_round_scores(
     return scores
 
 
+def _in_live_window(match: dict, now: datetime) -> bool:
+    kickoff = datetime.fromisoformat(match["matchDate"])
+    return kickoff <= now <= kickoff + LIVE_WINDOW
+
+
+def count_live_matches(matches: list[dict], now: datetime | None = None) -> int:
+    """Matches that are actually in progress: kickoff has passed and Scorito
+    hasn't marked them finished. This is what keeps the workflow's live loop
+    alive; the window is just a cap in case the Status flip ever lags."""
+    now = now or datetime.now(timezone.utc)
+    return sum(
+        1
+        for m in matches
+        if _in_live_window(m, now) and m["status"] != MATCH_STATUS_FINISHED
+    )
+
+
+def live_refresh_round_orders(matches: list[dict], now: datetime | None = None) -> set[int]:
+    """Rounds worth refreshing during a live update: any round with a match
+    whose kickoff falls in the live window, INCLUDING just-finished ones --
+    the pass right after a match ends must still pick up its final goals and
+    official round scores (count_live_matches already excludes it, so the
+    loop stops after that final pass)."""
+    now = now or datetime.now(timezone.utc)
+    return {m["roundOrder"] for m in matches if _in_live_window(m, now)}
+
+
+def load_roster_union() -> list[dict]:
+    """Unique participants across all poules, from the per-poule files a full
+    scrape wrote -- live updates reuse them instead of refetching rosters."""
+    participants: dict[int, dict] = {}
+    for pool in load_pools():
+        pool_file = POOLS_DATA_DIR / f"{pool['slug']}.json"
+        with pool_file.open(encoding="utf-8") as f:
+            for p in json.load(f)["participants"]:
+                participants.setdefault(p["userId"], p)
+    return list(participants.values())
+
+
+def run_live_update(cfg: Config) -> int:
+    """Refresh only what changes DURING a match -- live scores/goals for the
+    rounds currently being played, plus their official round scores -- and
+    merge into the existing shared.json from the last full scrape.
+
+    Predictions are locked once a round starts, and rosters/positions don't
+    move mid-match, so none of that is refetched: a live pass is ~5 requests
+    plus one round of official scores (~50), versus ~1400 for a full scrape.
+
+    Returns the number of matches still in progress (the workflow's live
+    loop keeps iterating while this is > 0).
+    """
+    if not SHARED_FILE.exists():
+        log.error("%s not found -- run a full scrape first.", SHARED_FILE)
+        sys.exit(1)
+    with SHARED_FILE.open(encoding="utf-8") as f:
+        old_shared = json.load(f)
+
+    try:
+        matches = fetch_match_schema(cfg)
+        refresh_orders = sorted(live_refresh_round_orders(matches))
+        refresh_round_ids = [round_id_for_order(cfg, order) for order in refresh_orders]
+        log.info("Live rounds to refresh: %s", refresh_orders or "none")
+
+        match_extra: dict[int, dict] = {}
+        new_players: dict[int, dict] = {}
+        live_scores: list[dict] = []
+        if refresh_round_ids:
+            participants = load_roster_union()
+            match_extra, new_players = fetch_match_details(cfg, refresh_round_ids)
+            live_scores = fetch_round_scores(cfg, participants, refresh_orders)
+        player_categories = fetch_player_positions(cfg)
+        group_standings = fetch_group_standings(cfg)
+    except requests.exceptions.RequestException as exc:
+        log.error("Request failed: %s", exc)
+        sys.exit(1)
+
+    # Fresh schema for every match (scores/statuses), but goals/full names
+    # only refetched for the live rounds -- everything else keeps what the
+    # last full scrape saw.
+    old_matches = {m["matchId"]: m for m in old_shared["matches"]}
+    for match in matches:
+        extra = match_extra.get(match["matchId"]) or old_matches.get(match["matchId"], {})
+        match["homeTeamFull"] = extra.get("homeTeamFull")
+        match["awayTeamFull"] = extra.get("awayTeamFull")
+        match["goals"] = extra.get("goals", [])
+
+    players = {p["playerId"]: p for p in old_shared["players"]}
+    players.update(new_players)
+    for player in players.values():
+        info = player_categories.get(player["playerId"], {})
+        player["category"] = info.get("category")
+        player["enrichedId"] = info.get("enrichedId")
+
+    refreshed_ids = set(refresh_round_ids)
+    round_scores = [
+        s for s in old_shared["roundScores"] if s["roundId"] not in refreshed_ids
+    ] + live_scores
+
+    save(
+        {
+            "marketId": cfg.market_id,
+            "eventId": cfg.event_id,
+            "matches": matches,
+            "players": list(players.values()),
+            "roundScores": round_scores,
+            "groupStandings": group_standings,
+        },
+        SHARED_FILE,
+    )
+    live = count_live_matches(matches)
+    log.info("Live update done; %d match(es) still in progress", live)
+    return live
+
+
 def save(data: dict, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
@@ -629,6 +756,34 @@ def save(data: dict, output_path: Path) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="refresh only the currently-live rounds' scores/goals into the "
+        "existing data files (requires a prior full scrape); prints the "
+        "number of matches still in progress",
+    )
+    parser.add_argument(
+        "--live-count",
+        action="store_true",
+        help="print how many matches are in progress according to the LOCAL "
+        "data files, without any network requests (the workflow's live "
+        "loop uses this as its continue condition)",
+    )
+    args = parser.parse_args()
+
+    if args.live_count:
+        with SHARED_FILE.open(encoding="utf-8") as f:
+            print(count_live_matches(json.load(f)["matches"]))
+        return
+
+    if args.live:
+        # stdout carries only the live count (logging goes to stderr), so
+        # the workflow can capture it without parsing log lines.
+        print(run_live_update(Config()))
+        return
+
     cfg = Config()
     pools = load_pools()
 

@@ -26,6 +26,9 @@ permissions:
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    # Full scrape + build is ~3 minutes; the live loop below adds at most
+    # LIVE_LOOP_MINUTES on top. Kill anything beyond that as hung.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -57,3 +60,39 @@ jobs:
             git commit -m "Auto-update dashboard $(date -u +'%Y-%m-%d %H:%M UTC')"
             git push
           fi
+
+      - name: Live-update while matches are in progress
+        env:
+          SCORITO_BEARER_TOKEN: ${{ secrets.SCORITO_BEARER_TOKEN }}
+          SCORITO_MARKET_ID: ${{ secrets.SCORITO_MARKET_ID }}
+          SCORITO_EVENT_ID: ${{ secrets.SCORITO_EVENT_ID }}
+        run: |
+          # While a match is in progress (kickoff passed, Scorito hasn't
+          # marked it finished), refresh just the live rounds' scores/goals
+          # every ~75s -- a handful of requests, not a full scrape -- and
+          # commit only when the dashboard actually changed. Goals are rare,
+          # so Netlify deploys roughly once per goal, not once per minute.
+          #
+          # --live-count reads the data files the previous step just wrote,
+          # so the common no-live-match case exits here without any network
+          # traffic. The loop hands over after LIVE_LOOP_MINUTES: the every-
+          # 15-min schedule plus the concurrency queue means a fresh run is
+          # normally already waiting to take its place.
+          LIVE_LOOP_MINUTES=25
+          deadline=$(( $(date +%s) + LIVE_LOOP_MINUTES * 60 ))
+          while [ "$(python scorito_scraper.py --live-count)" != "0" ]; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "Live loop reached ${LIVE_LOOP_MINUTES}m -- handing over to the next scheduled run."
+              break
+            fi
+            sleep 75
+            python scorito_scraper.py --live > /dev/null
+            python build_dashboard.py
+            git add dashboard.html
+            if git diff --cached --quiet; then
+              echo "$(date -u +'%H:%M:%S') no dashboard change"
+            else
+              git commit -m "Live update $(date -u +'%Y-%m-%d %H:%M UTC')"
+              git push
+            fi
+          done
