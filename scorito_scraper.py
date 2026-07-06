@@ -533,6 +533,7 @@ def fetch_match_details(cfg: Config, round_ids: list[int]):
                 "homeTeamFull": home_team.get("Name"),
                 "awayTeamFull": away_team.get("Name"),
                 "goals": goals,
+                "playMinute": m.get("PlayMinute") or None,
             }
 
     log.info(
@@ -719,6 +720,7 @@ def run_live_update(cfg: Config) -> int:
         match["homeTeamFull"] = extra.get("homeTeamFull")
         match["awayTeamFull"] = extra.get("awayTeamFull")
         match["goals"] = extra.get("goals", [])
+        match["playMinute"] = extra.get("playMinute")
 
     players = {p["playerId"]: p for p in old_shared["players"]}
     players.update(new_players)
@@ -834,6 +836,7 @@ def main() -> None:
         match["homeTeamFull"] = extra.get("homeTeamFull")
         match["awayTeamFull"] = extra.get("awayTeamFull")
         match["goals"] = extra.get("goals", [])
+        match["playMinute"] = extra.get("playMinute")
 
     for player in players.values():
         info = player_categories.get(player["playerId"], {})

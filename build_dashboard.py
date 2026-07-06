@@ -256,6 +256,7 @@ def build_pool_payload(pool_meta: dict, roster: list[dict], d: dict, preds: dict
             "homeTeam": m.get("homeTeamFull") or m["homeTeam"],
             "awayTeam": m.get("awayTeamFull") or m["awayTeam"],
             "status": m["status"],
+            "playMinute": m.get("playMinute") if is_live else None,
             "actual": actual,
             "predictions": predictions,
         }
