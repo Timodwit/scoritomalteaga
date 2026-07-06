@@ -1,0 +1,13 @@
+# Secrets
+.env
+
+# Generated raw data (contains pool members' names/scores) -- dashboard.html
+# IS committed on purpose: the GitHub Actions workflow regenerates and
+# commits it on a schedule, and Netlify deploys it directly from the repo.
+data/*.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

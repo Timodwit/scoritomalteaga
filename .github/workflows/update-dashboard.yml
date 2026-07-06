@@ -1,0 +1,47 @@
+name: Update dashboard
+
+on:
+  schedule:
+    # Every 15 minutes. GitHub may delay this slightly under load -- that's
+    # expected and fine for this use case.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {} # lets you trigger a run manually from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch latest Scorito data
+        env:
+          SCORITO_BEARER_TOKEN: ${{ secrets.SCORITO_BEARER_TOKEN }}
+          SCORITO_MARKET_ID: ${{ secrets.SCORITO_MARKET_ID }}
+          SCORITO_POOL_ID: ${{ secrets.SCORITO_POOL_ID }}
+          SCORITO_EVENT_ID: ${{ secrets.SCORITO_EVENT_ID }}
+        run: python scorito_scraper.py
+
+      - name: Rebuild dashboard.html
+        run: python build_dashboard.py
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add dashboard.html
+          if git diff --cached --quiet; then
+            echo "No changes to dashboard.html -- skipping commit."
+          else
+            git commit -m "Auto-update dashboard $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
