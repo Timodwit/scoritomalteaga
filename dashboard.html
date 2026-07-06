@@ -245,6 +245,7 @@
   .race-dot.dimmed { opacity: 0.3; }
   .axis-label { fill: var(--ink-muted); font-size: 11px; font-family: -apple-system, "Segoe UI", sans-serif; }
   .grid-line { stroke: var(--grid); stroke-width: 1px; }
+  .round-divider { stroke: var(--grid); stroke-width: 1px; stroke-dasharray: 2 3; opacity: 0.7; }
   .now-line { stroke: var(--accent); stroke-width: 1.5px; stroke-dasharray: 3 3; }
   .now-label { fill: var(--accent); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; }
   .end-label { font-size: 12px; font-weight: 600; font-family: -apple-system, "Segoe UI", sans-serif; }
@@ -379,6 +380,40 @@
     color: var(--ink-muted);
     margin: 10px 4px 4px;
   }
+
+  /* ---------- Round winners ---------- */
+  .round-winners-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 4px 20px;
+    display: flex;
+    flex-direction: column;
+  }
+  .round-winner-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 11px 0;
+    border-top: 1px solid var(--grid);
+  }
+  .round-winner-row:first-child { border-top: none; }
+  .round-winner-round {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--ink-muted);
+    background: var(--surface-2);
+    border-radius: 999px;
+    padding: 4px 10px;
+    flex: none;
+    width: 96px;
+    text-align: center;
+  }
+  .round-winner-name { font-weight: 700; flex: 1; }
+  .round-winner-name.tie { font-weight: 600; color: var(--ink-2); }
+  .round-winner-points { font-variant-numeric: tabular-nums; font-weight: 700; color: var(--accent); flex: none; }
 
   /* ---------- Live banner ---------- */
   .live-banner {
@@ -703,6 +738,14 @@
       </div>
       <p class="chart-note" id="chart-note"></p>
     </div>
+  </div>
+
+  <div>
+    <div class="section-head">
+      <h2>Rondewinnaars</h2>
+      <p>Wie de meeste punten pakte in elke ronde, los van het totaalklassement.</p>
+    </div>
+    <div class="round-winners-card" id="round-winners-card"></div>
   </div>
 
   <div id="compare-section" hidden>
@@ -17970,6 +18013,43 @@
           ]
         }
       ]
+    }
+  ],
+  "roundWinners": [
+    {
+      "roundName": "Ronde 1",
+      "winnerNames": [
+        "Dingetje"
+      ],
+      "points": 484
+    },
+    {
+      "roundName": "Ronde 2",
+      "winnerNames": [
+        "Lotte"
+      ],
+      "points": 619
+    },
+    {
+      "roundName": "Ronde 3",
+      "winnerNames": [
+        "Dingetje"
+      ],
+      "points": 1313
+    },
+    {
+      "roundName": "Laatste 32",
+      "winnerNames": [
+        "Lotte"
+      ],
+      "points": 950
+    },
+    {
+      "roundName": "1/8e finale",
+      "winnerNames": [
+        "Plasvagina"
+      ],
+      "points": 429
     }
   ],
   "liveMatchId": null,
@@ -38518,6 +38598,7 @@
   var matchesByRound = data.matchesByRound || [];
   var allMatchesFlat = [];
   matchesByRound.forEach(function (g) { allMatchesFlat = allMatchesFlat.concat(g.matches); });
+  var roundWinners = data.roundWinners || [];
   var liveMatchId = data.liveMatchId;
   var participantDetails = data.participantDetails || {};
 
@@ -38725,19 +38806,30 @@
     svg.appendChild(t);
   }
 
-  // x axis labels: one per round, positioned at that round's last match
-  // (too many matches to label individually -- ~90+ points on this axis).
+  // x axis labels: one per round, centered over that round's own span of
+  // matches (too many matches to label individually -- ~90+ points on this
+  // axis) -- plus a full-height divider AT the boundary between rounds, so
+  // it's unambiguous where one round ends and the next begins, instead of a
+  // single label sitting right on the seam.
   var roundBoundaries = [];
   matches.forEach(function (m, i) {
     var last = roundBoundaries[roundBoundaries.length - 1];
     if (last && last.roundName === m.roundName) {
       last.lastIdx = i;
     } else {
-      roundBoundaries.push({ roundName: m.roundName, lastIdx: i });
+      roundBoundaries.push({ roundName: m.roundName, firstIdx: i, lastIdx: i });
     }
   });
   roundBoundaries.forEach(function (b, bi) {
-    var bx = xFor(b.lastIdx);
+    if (bi > 0) {
+      var dividerX = xFor(b.firstIdx - 0.5);
+      svg.appendChild(el("line", {
+        x1: dividerX, x2: dividerX, y1: M.top, y2: H - M.bottom,
+        class: "round-divider"
+      }));
+    }
+
+    var bx = xFor((b.firstIdx + b.lastIdx) / 2);
     // Rounds with few matches (R32, R16) sit close together on the axis --
     // stagger alternating labels onto a second row so adjacent ones don't
     // collide, and give each a short tick connecting it to its real position.
@@ -38747,10 +38839,10 @@
       x1: bx, x2: bx, y1: H - M.bottom + 2, y2: H - M.bottom + 6 + row * 13,
       class: "grid-line"
     }));
-    var t = el("text", {
-      x: bx, y: ty, class: "axis-label",
-      "text-anchor": bi === roundBoundaries.length - 1 ? "end" : "middle"
-    });
+    var anchor = "middle";
+    if (bx > W - M.right - 15) anchor = "end";
+    else if (bx < M.left + 15) anchor = "start";
+    var t = el("text", { x: bx, y: ty, class: "axis-label", "text-anchor": anchor });
     t.textContent = b.roundName;
     svg.appendChild(t);
   });
@@ -39351,8 +39443,43 @@
     if (evt.key === "Escape") closeParticipantDetail();
   });
 
+  // ---------------- Round winners ----------------
+  function renderRoundWinners() {
+    var card = document.getElementById("round-winners-card");
+    card.innerHTML = "";
+    if (roundWinners.length === 0) {
+      var empty = document.createElement("p");
+      empty.className = "standings-hint";
+      empty.textContent = "Nog geen rondes afgerond.";
+      card.appendChild(empty);
+      return;
+    }
+    roundWinners.forEach(function (rw) {
+      var row = document.createElement("div");
+      row.className = "round-winner-row";
+
+      var roundEl = document.createElement("span");
+      roundEl.className = "round-winner-round";
+      roundEl.textContent = rw.roundName;
+
+      var nameEl = document.createElement("span");
+      nameEl.className = "round-winner-name" + (rw.winnerNames.length > 1 ? " tie" : "");
+      nameEl.textContent = rw.winnerNames.length ? rw.winnerNames.join(" & ") : "—";
+
+      var ptsEl = document.createElement("span");
+      ptsEl.className = "round-winner-points";
+      ptsEl.textContent = rw.winnerNames.length ? "+" + rw.points.toLocaleString("nl-NL") + " pt" : "";
+
+      row.appendChild(roundEl);
+      row.appendChild(nameEl);
+      row.appendChild(ptsEl);
+      card.appendChild(row);
+    });
+  }
+
   renderLiveBanner();
   renderMatchesList();
+  renderRoundWinners();
 
   document.querySelector(".wrap").style.position = "relative";
 })();

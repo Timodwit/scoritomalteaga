@@ -87,6 +87,31 @@ def build_payload() -> dict:
         if gain == riser_value and riser_value > 0
     ]
 
+    # ---- per-round winners: who scored the most points in EACH round
+    # that's been played so far (not just the most recent one) -- in
+    # forward chronological order, i.e. the tournament's own story.
+    round_order_seen = []
+    round_indices = {}
+    for i, m in enumerate(computed["matches"]):
+        if m["roundName"] not in round_indices:
+            round_order_seen.append(m["roundName"])
+            round_indices[m["roundName"]] = []
+        round_indices[m["roundName"]].append(i)
+
+    round_winners = []
+    for round_name in round_order_seen:
+        indices = round_indices[round_name]
+        gains = {
+            s["userId"]: sum(s["matchPoints"][i] for i in indices) for s in computed["series"]
+        }
+        best = max(gains.values()) if gains else 0
+        winners = [
+            computed_by_user[uid]["userName"]
+            for uid, gain in gains.items()
+            if gain == best and best > 0
+        ]
+        round_winners.append({"roundName": round_name, "winnerNames": winners, "points": best})
+
     leader = participants[0]
 
     # ---- players + topscorer picks, resolved for direct display ----
@@ -309,6 +334,7 @@ def build_payload() -> dict:
         },
         "scoringRules": SCORING_RULES,
         "matchesByRound": matches_by_round,
+        "roundWinners": round_winners,
         "liveMatchId": live_match["matchId"] if live_match else None,
         "participantDetails": participant_details,
     }
