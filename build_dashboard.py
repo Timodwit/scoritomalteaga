@@ -292,19 +292,22 @@ def build_pool_payload(pool_meta: dict, roster: list[dict], d: dict, preds: dict
                 "awayTeam": away_name,
                 "status": m["status"],
                 "predicted": {"home": pred[0], "away": pred[1]} if pred else None,
+                # Live matches (status 1) show their provisional state: the
+                # current score and the points it would earn if it stayed
+                # this way, recomputed by every live-update pass.
                 "actual": (
                     {"home": m["homeScore"], "away": m["awayScore"]}
-                    if m["status"] == 2
+                    if m["status"] in (1, 2)
                     else None
                 ),
                 "points": (
                     match_points_by_user_match.get((uid, m["matchId"]))
-                    if m["status"] == 2
+                    if m["status"] in (1, 2)
                     else None
                 ),
                 "resultType": (
                     result_type_by_user_match.get((uid, m["matchId"]))
-                    if m["status"] == 2
+                    if m["status"] in (1, 2)
                     else None
                 ),
                 "topscorerInPlay": topscorer_in_play(uid, tier, m["homeTeamId"], m["awayTeamId"])

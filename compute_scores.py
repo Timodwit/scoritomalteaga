@@ -230,8 +230,14 @@ def build_payload(participants: list[dict], results: dict, preds: dict) -> dict:
     the caller loads them once and passes them in rather than this function
     reading fixed files itself.
     """
-    matches = [m for m in results["matches"] if m["status"] == 2]
+    # Status 1 (in progress) counts too: a live match's CURRENT score earns
+    # provisional points that shift with every goal -- that's the whole point
+    # of the live-update loop. Group-position bonuses still require the whole
+    # group finished (compute_group_position_bonus checks status == 2 itself),
+    # and the champion bonus requires roundWinnerType, set only at full time.
+    matches = [m for m in results["matches"] if m["status"] in (1, 2)]
     matches.sort(key=lambda m: m["matchDate"])
+    live_round_names = {m["roundName"] for m in matches if m["status"] == 1}
 
     player_category = {p["playerId"]: p.get("category") for p in results["players"]}
     # Topscorer predictions identify players by "TeamPlayerEnrichedId", a
@@ -371,12 +377,17 @@ def build_payload(participants: list[dict], results: dict, preds: dict) -> dict:
     for s in series:
         uid = s["userId"]
         gap = s["totalPoints"] - s["computedTotal"]
-        if abs(gap) > 1:
+        # While a match is live, computed totals intentionally run ahead of
+        # (or behind) Scorito's official numbers -- gaps are expected, not a
+        # scoring-model bug, so don't drown the QA signal in them.
+        if abs(gap) > 1 and not live_round_names:
             print(
                 f"WARNING: {s['userName']} computed total {s['computedTotal']} "
                 f"vs Scorito's official total {s['totalPoints']} (gap {gap:+d})"
             )
         for round_name, round_matches in _matches_by_round(matches).items():
+            if round_name in live_round_names:
+                continue
             official_total = official_round_points.get(uid, {}).get(round_name)
             if official_total is None:
                 continue
