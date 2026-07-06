@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 
 from compute_scores import build_payload as build_computed_payload
-from compute_scores import outcome_sign
+from compute_scores import outcome_sign, TIER_MULT, BASE_WINNER, BASE_EXACT, BASE_TOPSCORER
 
 ROOT = Path(__file__).parent
 DASHBOARD_FILE = ROOT / "dashboard.html"
@@ -76,22 +76,52 @@ def build_payload() -> dict:
     leader = participants[0]
 
     # ---- players + topscorer picks, resolved for direct display ----
+    # Topscorer picks change every round, so everything here is keyed by
+    # (userId, tier) rather than just userId -- tier is the same 1-6 scale
+    # match points use (group=1 ... final/3rd=6).
     player_by_enriched_id = {
         p["enrichedId"]: p for p in d["players"] if p.get("enrichedId") is not None
     }
-    topscorer_picks_by_user = {
-        t["userId"]: [
-            player_by_enriched_id[eid]
-            for eid in t["playerIds"]
-            if eid in player_by_enriched_id
-        ]
-        for t in preds["topScorerPredictions"]
-    }
+    player_category = {p["playerId"]: p.get("category") for p in d["players"]}
+    player_enriched_id = {p["playerId"]: p.get("enrichedId") for p in d["players"]}
 
-    def resolved_picks(uid):
+    topscorer_picks_by_user_tier = {}
+    for t in preds["topScorerPredictions"]:
+        key = (t["userId"], t["tier"])
+        topscorer_picks_by_user_tier[key] = {
+            "roundName": t["roundName"],
+            "enrichedIds": set(t["playerIds"]),
+            "players": [
+                player_by_enriched_id[eid] for eid in t["playerIds"] if eid in player_by_enriched_id
+            ],
+        }
+
+    def resolved_picks_by_tier(uid):
+        entries = []
+        for tier in range(1, 7):
+            info = topscorer_picks_by_user_tier.get((uid, tier))
+            if not info:
+                continue
+            entries.append(
+                {
+                    "tier": tier,
+                    "roundName": info["roundName"],
+                    "picks": [
+                        {"name": pl["name"], "teamName": pl["teamName"], "category": pl.get("category")}
+                        for pl in info["players"]
+                    ],
+                }
+            )
+        return entries
+
+    def topscorer_in_play(uid, tier, home_team_id, away_team_id):
+        info = topscorer_picks_by_user_tier.get((uid, tier))
+        if not info:
+            return []
         return [
-            {"name": pl["name"], "teamName": pl["teamName"], "category": pl.get("category")}
-            for pl in topscorer_picks_by_user.get(uid, [])
+            {"name": pl["name"], "teamName": pl["teamName"]}
+            for pl in info["players"]
+            if pl.get("teamId") in (home_team_id, away_team_id)
         ]
 
     # ---- predictions lookup: (userId, matchId) -> (home, away) ----
@@ -100,19 +130,43 @@ def build_payload() -> dict:
         for p in preds["predictions"]
     }
 
-    # per-match computed points, for showing "you earned N points" on played
-    # matches in the participant detail view (aligned with computed["matches"])
+    # per-match computed points + exact/winner/miss labels, for the "you
+    # earned N points" view on played matches (aligned with computed["matches"])
     match_points_by_user_match = {}
+    result_type_by_user_match = {}
     for s in computed["series"]:
-        for m, pts in zip(computed["matches"], s["matchPoints"]):
+        for m, pts, rtype in zip(computed["matches"], s["matchPoints"], s["resultTypes"]):
             match_points_by_user_match[(s["userId"], m["matchId"])] = pts
+            result_type_by_user_match[(s["userId"], m["matchId"])] = rtype
 
-    def topscorer_in_play(uid, home_team_id, away_team_id):
-        return [
-            {"name": pl["name"], "teamName": pl["teamName"]}
-            for pl in topscorer_picks_by_user.get(uid, [])
-            if pl.get("teamId") in (home_team_id, away_team_id)
-        ]
+    def virtual_points_for_live_match(uid, m, tier):
+        """What a prediction would earn right now if the live match ended at
+        its current score -- match points plus topscorer bonus from goals
+        scored so far, using THIS round's topscorer pick."""
+        pred = prediction_by_user_match.get((uid, m["matchId"]))
+        match_pts = 0
+        result_class = None
+        if pred:
+            if (pred[0], pred[1]) == (m["homeScore"], m["awayScore"]):
+                match_pts = BASE_EXACT * tier
+                result_class = "exact"
+            elif outcome_sign(pred[0], pred[1]) == outcome_sign(m["homeScore"], m["awayScore"]):
+                match_pts = BASE_WINNER * tier
+                result_class = "winner"
+            else:
+                result_class = "wrong"
+
+        ts_points = 0
+        ts_info = topscorer_picks_by_user_tier.get((uid, tier))
+        if ts_info:
+            for goal in m.get("goals", []):
+                eid = player_enriched_id.get(goal["playerId"])
+                if eid is not None and eid in ts_info["enrichedIds"]:
+                    cat = player_category.get(goal["playerId"])
+                    if cat:
+                        ts_points += BASE_TOPSCORER[cat] * tier
+
+        return match_pts, ts_points, result_class
 
     all_matches_sorted = sorted(d["matches"], key=lambda m: m["matchDate"])
 
@@ -126,26 +180,26 @@ def build_payload() -> dict:
         if m["homeTeamId"] is None or m["awayTeamId"] is None:
             continue
         is_live = m["status"] == 1
+        tier = TIER_MULT[m["roundOrder"]]
         actual = {"home": m["homeScore"], "away": m["awayScore"]} if is_live else None
         predictions = []
         for p in participants:
             uid = p["userId"]
             pred = prediction_by_user_match.get((uid, m["matchId"]))
             result_class = None
-            if is_live and pred:
-                if (pred[0], pred[1]) == (m["homeScore"], m["awayScore"]):
-                    result_class = "correct"
-                elif outcome_sign(pred[0], pred[1]) == outcome_sign(m["homeScore"], m["awayScore"]):
-                    result_class = "correct"
-                else:
-                    result_class = "wrong"
+            match_pts = ts_pts = None
+            if is_live:
+                match_pts, ts_pts, result_class = virtual_points_for_live_match(uid, m, tier)
             predictions.append(
                 {
                     "userId": uid,
                     "userName": p["userName"],
                     "predicted": {"home": pred[0], "away": pred[1]} if pred else None,
                     "resultClass": result_class,
-                    "topscorerInPlay": topscorer_in_play(uid, m["homeTeamId"], m["awayTeamId"]),
+                    "virtualMatchPoints": match_pts,
+                    "virtualTopscorerPoints": ts_pts,
+                    "virtualTotalPoints": (match_pts + ts_pts) if is_live else None,
+                    "topscorerInPlay": topscorer_in_play(uid, tier, m["homeTeamId"], m["awayTeamId"]),
                 }
             )
         upcoming_matches.append(
@@ -173,6 +227,7 @@ def build_payload() -> dict:
             away_name = m.get("awayTeamFull") or m["awayTeam"]
             if not home_name or not away_name:
                 continue
+            tier = TIER_MULT[m["roundOrder"]]
             pred = prediction_by_user_match.get((uid, m["matchId"]))
             row = {
                 "matchId": m["matchId"],
@@ -192,7 +247,12 @@ def build_payload() -> dict:
                     if m["status"] == 2
                     else None
                 ),
-                "topscorerInPlay": topscorer_in_play(uid, m["homeTeamId"], m["awayTeamId"])
+                "resultType": (
+                    result_type_by_user_match.get((uid, m["matchId"]))
+                    if m["status"] == 2
+                    else None
+                ),
+                "topscorerInPlay": topscorer_in_play(uid, tier, m["homeTeamId"], m["awayTeamId"])
                 if m["homeTeamId"] is not None and m["awayTeamId"] is not None
                 else [],
             }
@@ -203,7 +263,7 @@ def build_payload() -> dict:
             "userName": p["userName"],
             "rank": p["rank"],
             "totalPoints": p["totalPoints"],
-            "topscorerPicks": resolved_picks(uid),
+            "topscorerPicksByRound": resolved_picks_by_tier(uid),
             "matches": match_rows,
         }
 

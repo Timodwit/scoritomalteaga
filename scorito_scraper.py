@@ -44,11 +44,15 @@ BROWSER_HEADERS = {
 
 # Scorito labels knockout rounds by "EventRoundOrder" (group stage matchdays
 # are 1-3, then the knockout bracket continues 4-9). Group stage matchdays
-# all share one prediction/score round id, so they're grouped as one round there.
+# are THREE INDEPENDENT rounds in Scorito's own scoring (confirmed via the
+# Gamecenter UI's own round dropdown: "Ronde 1"/"Ronde 2"/"Ronde 3", each with
+# its own score -- NOT a single cumulative "Groepsfase" total). Ronde 3's own
+# total also includes the group-position bonus, since that's when groups
+# finalize.
 ROUND_NAMES = {
-    1: "Groepsfase",
-    2: "Groepsfase",
-    3: "Groepsfase",
+    1: "Ronde 1",
+    2: "Ronde 2",
+    3: "Ronde 3",
     4: "Laatste 32",
     5: "1/8e finale",
     6: "Kwartfinale",
@@ -58,6 +62,21 @@ ROUND_NAMES = {
 }
 
 GOAL_EVENT_TYPE = 1
+
+# The pool's point table scales 1x/2x/3x/4x/5x/6x from the group-stage base
+# across group/R32/R16/QF/SF/final+3rd -- both match-point tiers AND, as
+# discovered directly from Scorito's API, topscorer-prediction ids follow
+# this same 6-tier scheme (topscorer id = offset + tier). Topscorer picks
+# can be changed every round, unlike the champion pick (made once).
+ROUND_TIER = {1: 1, 2: 1, 3: 1, 4: 2, 5: 3, 6: 4, 7: 5, 8: 6, 9: 6}
+TIER_NAMES = {
+    1: "Groepsfase",
+    2: "Laatste 32",
+    3: "1/8e finale",
+    4: "Kwartfinale",
+    5: "Halve finale",
+    6: "Finale / Troostfinale",
+}
 
 # Scorito's player position field is a bitmask, confirmed empirically against
 # known players (Alisson=1, Van Dijk=2, Kakuta=4, Messi/Mbappe/Haaland=8) and
@@ -74,7 +93,7 @@ class Config:
         self.pool_id = os.getenv("SCORITO_POOL_ID")
         self.event_id = os.getenv("SCORITO_EVENT_ID")
         self.round_id_offset = int(os.getenv("SCORITO_ROUND_ID_OFFSET", "7161"))
-        self.topscorer_prediction_id = os.getenv("SCORITO_TOPSCORER_PREDICTION_ID", "460")
+        self.topscorer_id_offset = int(os.getenv("SCORITO_TOPSCORER_ID_OFFSET", "457"))
 
         missing = [
             name
@@ -156,13 +175,14 @@ def get_json_any_version(
 
 
 def round_id_for_order(cfg: Config, order: int) -> int:
-    if order in (1, 2, 3):
-        # The three group-stage matchdays share one prediction dataset (all
-        # three ids return the same 72 matches), but scoreblock/userscore
-        # treats them as cumulative checkpoints (matchday1 < matchday1+2 <
-        # matchday1+2+3). Use the last one so round totals reflect the whole
-        # group stage, not just matchday 1.
-        return cfg.round_id_offset + 3
+    # Each EventRoundOrder -- including the three group-stage matchdays -- is
+    # its own independent round id. Confirmed directly against the
+    # Gamecenter UI's own round dropdown ("Ronde 1"/"Ronde 2"/"Ronde 3" are
+    # separate entries with separate scores, not one cumulative "Groepsfase"
+    # total). Predictions happen to be identical across all three (verified
+    # empirically), so fetching each independently just costs a few redundant
+    # calls; round scores and match/goal details are NOT identical per
+    # matchday and must be fetched per round id or they go silently missing.
     return cfg.round_id_offset + order
 
 
@@ -284,36 +304,47 @@ def fetch_predictions(
 
 
 def fetch_topscorer_predictions(
-    cfg: Config, participants: list[dict], version_cache: dict
+    cfg: Config, participants: list[dict], round_orders: list[int], version_cache: dict
 ) -> list[dict]:
-    """Each user's one-time topscorer pick (made at tournament start, not per round)."""
+    """Each user's topscorer pick PER ROUND TIER -- confirmed empirically that
+    picks can change every round (topscorer id = topscorer_id_offset + tier,
+    the same 1-6 tier scheme as match points)."""
+    tiers = sorted({ROUND_TIER[order] for order in round_orders})
     predictions = []
 
-    for participant in participants:
-        user_id = participant["userId"]
-        url = (
-            "https://ftm-prediction-query.scorito.com/{version}/v1.0/topscorerprediction/"
-            f"{cfg.topscorer_prediction_id}/{user_id}"
-        )
-        content = get_json_any_version(
-            url,
-            cfg.headers(),
-            version_cache,
-            user_id,
-            is_valid=lambda c: bool(c.get("teamPlayerEnrichedIds")) if c else False,
-        )
-        if not content:
-            continue
-        predictions.append(
-            {
-                "userId": content["userId"],
-                "userName": participant["userName"],
-                "playerIds": content["teamPlayerEnrichedIds"],
-                "dateTimePredicted": content["dateTimePredicted"],
-            }
-        )
+    for tier in tiers:
+        topscorer_id = cfg.topscorer_id_offset + tier
+        for participant in participants:
+            user_id = participant["userId"]
+            url = (
+                "https://ftm-prediction-query.scorito.com/{version}/v1.0/topscorerprediction/"
+                f"{topscorer_id}/{user_id}"
+            )
+            content = get_json_any_version(
+                url,
+                cfg.headers(),
+                version_cache,
+                user_id,
+                is_valid=lambda c: bool(c.get("teamPlayerEnrichedIds")) if c else False,
+            )
+            if not content:
+                continue
+            predictions.append(
+                {
+                    "userId": content["userId"],
+                    "userName": participant["userName"],
+                    "tier": tier,
+                    "roundName": TIER_NAMES.get(tier, f"Tier {tier}"),
+                    "playerIds": content["teamPlayerEnrichedIds"],
+                    "dateTimePredicted": content["dateTimePredicted"],
+                }
+            )
 
-    log.info("Collected %d topscorer predictions", len(predictions))
+    log.info(
+        "Collected %d topscorer predictions across %d round tiers",
+        len(predictions),
+        len(tiers),
+    )
     return predictions
 
 
@@ -483,7 +514,7 @@ def main() -> None:
         version_cache: dict[int, str] = {}
         predictions = fetch_predictions(cfg, participants, round_orders, version_cache)
         topscorer_predictions = fetch_topscorer_predictions(
-            cfg, participants, version_cache
+            cfg, participants, round_orders, version_cache
         )
         champion_predictions = fetch_champion_predictions(
             cfg, participants, version_cache
