@@ -39020,7 +39020,13 @@
   // ---------------- Upcoming/live matches ----------------
   var dateFormatter = new Intl.DateTimeFormat("nl-NL", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
   function formatMatchDate(iso) {
-    return dateFormatter.format(new Date(iso));
+    // Scorito's API returns UTC timestamps with no timezone marker (e.g.
+    // "2026-06-24T02:00:00"). Per the JS Date spec, a date-time string with
+    // no offset is parsed as LOCAL time, not UTC -- so without forcing UTC
+    // here, every match time would be off by the viewer's UTC offset (e.g.
+    // 2 hours for Dutch summer time).
+    var hasTimezone = /Z$|[+-]\d\d:?\d\d$/.test(iso);
+    return dateFormatter.format(new Date(hasTimezone ? iso : iso + "Z"));
   }
 
   function renderLiveBanner() {

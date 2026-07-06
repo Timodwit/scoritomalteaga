@@ -223,7 +223,12 @@ def fetch_match_schema(cfg: Config) -> list[dict]:
                     "roundName": ROUND_NAMES.get(
                         m["EventRoundOrder"], f"Ronde {m['EventRoundOrder']}"
                     ),
-                    "matchDate": m["MatchDate"],
+                    # Scorito returns UTC timestamps with no timezone marker
+                    # (e.g. "2026-06-24T02:00:00") -- append "Z" so it's
+                    # unambiguous UTC for any consumer (JS Date, Python
+                    # datetime.fromisoformat), instead of silently being
+                    # parsed as local time.
+                    "matchDate": m["MatchDate"] + "Z",
                     "homeTeam": m["HomeTeamNameShort"],
                     "awayTeam": m["AwayTeamNameShort"],
                     "homeTeamId": m["HomeTeamId"],
