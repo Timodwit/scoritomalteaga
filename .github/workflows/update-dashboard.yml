@@ -2,9 +2,10 @@ name: Update dashboard
 
 on:
   schedule:
-    # Every 15 minutes. GitHub may delay this slightly under load -- that's
-    # expected and fine for this use case.
-    - cron: "*/15 * * * *"
+    # Every 15 minutes, offset from :00/:15/:30/:45 -- GitHub's own docs warn
+    # those exact marks see the heaviest queueing/delay since everyone's cron
+    # jobs fire at once. A few minutes off that avoids most of the backlog.
+    - cron: "6,21,36,51 * * * *"
   workflow_dispatch: {} # lets you trigger a run manually from the Actions tab
 
 permissions:
