@@ -13,6 +13,14 @@ from pathlib import Path
 from compute_scores import build_payload as build_computed_payload
 from compute_scores import outcome_sign, TIER_MULT, BASE_WINNER, BASE_EXACT, BASE_TOPSCORER
 
+# Canonical round order for grouping the match list, most recent first (so
+# the live/upcoming action surfaces near the top instead of being buried
+# under 90+ already-played group-stage matches).
+ROUND_ORDER = [
+    "Finale", "Troostfinale", "Halve finale", "Kwartfinale",
+    "1/8e finale", "Laatste 32", "Ronde 3", "Ronde 2", "Ronde 1",
+]
+
 ROOT = Path(__file__).parent
 DASHBOARD_FILE = ROOT / "dashboard.html"
 
@@ -59,19 +67,25 @@ def build_payload() -> dict:
     total_matches = len(d["matches"])
     goal_count = sum(len(m.get("goals", [])) for m in d["matches"])
 
-    # "biggest riser" = largest single-match jump in the most recently played match
-    last_match_gain = {
-        s["userId"]: (s["cumulative"][-1] - s["cumulative"][-2]) if len(s["cumulative"]) > 1 else s["cumulative"][-1]
+    # "biggest riser" = largest gain across the most recently active ROUND
+    # (all matches sharing the round of the last-played match), not just a
+    # single game -- a round can span many matches (e.g. 24 in the group
+    # stage), so judging by one match alone was misleading.
+    last_match = computed["matches"][-1] if computed["matches"] else None
+    current_round_name = last_match["roundName"] if last_match else None
+    round_match_indices = [
+        i for i, m in enumerate(computed["matches"]) if m["roundName"] == current_round_name
+    ]
+    round_gain = {
+        s["userId"]: sum(s["matchPoints"][i] for i in round_match_indices)
         for s in computed["series"]
-        if s["cumulative"]
     }
-    riser_value = max(last_match_gain.values()) if last_match_gain else 0
+    riser_value = max(round_gain.values()) if round_gain else 0
     risers = [
         computed_by_user[uid]["userName"]
-        for uid, gain in last_match_gain.items()
+        for uid, gain in round_gain.items()
         if gain == riser_value and riser_value > 0
     ]
-    last_match = computed["matches"][-1] if computed["matches"] else None
 
     leader = participants[0]
 
@@ -139,10 +153,11 @@ def build_payload() -> dict:
             match_points_by_user_match[(s["userId"], m["matchId"])] = pts
             result_type_by_user_match[(s["userId"], m["matchId"])] = rtype
 
-    def virtual_points_for_live_match(uid, m, tier):
-        """What a prediction would earn right now if the live match ended at
-        its current score -- match points plus topscorer bonus from goals
-        scored so far, using THIS round's topscorer pick."""
+    def points_for_match(uid, m, tier):
+        """Points a prediction earns for this match -- final if the match has
+        finished, or "right now" if it's still live (based on the current
+        score and goals scored so far). Same formula either way; only the
+        goals/score inputs change as the match progresses."""
         pred = prediction_by_user_match.get((uid, m["matchId"]))
         match_pts = 0
         result_class = None
@@ -154,7 +169,7 @@ def build_payload() -> dict:
                 match_pts = BASE_WINNER * tier
                 result_class = "winner"
             else:
-                result_class = "wrong"
+                result_class = "miss"
 
         ts_points = 0
         ts_info = topscorer_picks_by_user_tier.get((uid, tier))
@@ -170,52 +185,63 @@ def build_payload() -> dict:
 
     all_matches_sorted = sorted(d["matches"], key=lambda m: m["matchDate"])
 
-    # ---- upcoming/live matches with everyone's predictions ----
-    upcoming_matches = []
+    # ---- every match (past, live, upcoming) with everyone's predictions,
+    # grouped by round so results and upcoming games can both be browsed
+    # round by round instead of one long chronological list.
+    matches_by_round_dict = {}
     for m in all_matches_sorted:
-        if m["status"] == 2:
-            continue
         if not m.get("homeTeamFull") and not m["homeTeam"]:
             continue
         if m["homeTeamId"] is None or m["awayTeamId"] is None:
             continue
         is_live = m["status"] == 1
+        is_finished = m["status"] == 2
         tier = TIER_MULT[m["roundOrder"]]
-        actual = {"home": m["homeScore"], "away": m["awayScore"]} if is_live else None
+        actual = (
+            {"home": m["homeScore"], "away": m["awayScore"]} if (is_live or is_finished) else None
+        )
         predictions = []
         for p in participants:
             uid = p["userId"]
             pred = prediction_by_user_match.get((uid, m["matchId"]))
             result_class = None
             match_pts = ts_pts = None
-            if is_live:
-                match_pts, ts_pts, result_class = virtual_points_for_live_match(uid, m, tier)
+            if is_live or is_finished:
+                match_pts, ts_pts, result_class = points_for_match(uid, m, tier)
             predictions.append(
                 {
                     "userId": uid,
                     "userName": p["userName"],
                     "predicted": {"home": pred[0], "away": pred[1]} if pred else None,
                     "resultClass": result_class,
-                    "virtualMatchPoints": match_pts,
-                    "virtualTopscorerPoints": ts_pts,
-                    "virtualTotalPoints": (match_pts + ts_pts) if is_live else None,
+                    "matchPoints": match_pts,
+                    "topscorerPoints": ts_pts,
+                    "totalPoints": (match_pts + ts_pts) if (is_live or is_finished) else None,
                     "topscorerInPlay": topscorer_in_play(uid, tier, m["homeTeamId"], m["awayTeamId"]),
                 }
             )
-        upcoming_matches.append(
-            {
-                "matchId": m["matchId"],
-                "matchDate": m["matchDate"],
-                "roundName": m["roundName"],
-                "homeTeam": m.get("homeTeamFull") or m["homeTeam"],
-                "awayTeam": m.get("awayTeamFull") or m["awayTeam"],
-                "status": m["status"],
-                "actual": actual,
-                "predictions": predictions,
-            }
-        )
+        entry = {
+            "matchId": m["matchId"],
+            "matchDate": m["matchDate"],
+            "roundName": m["roundName"],
+            "homeTeam": m.get("homeTeamFull") or m["homeTeam"],
+            "awayTeam": m.get("awayTeamFull") or m["awayTeam"],
+            "status": m["status"],
+            "actual": actual,
+            "predictions": predictions,
+        }
+        matches_by_round_dict.setdefault(m["roundName"], []).append(entry)
 
-    live_match = next((m for m in upcoming_matches if m["status"] == 1), None)
+    matches_by_round = [
+        {"roundName": name, "matches": matches_by_round_dict[name]}
+        for name in ROUND_ORDER
+        if name in matches_by_round_dict
+    ]
+
+    live_match = next(
+        (m for round_group in matches_by_round for m in round_group["matches"] if m["status"] == 1),
+        None,
+    )
 
     # ---- per-participant full prediction history (past + upcoming) ----
     participant_details = {}
@@ -276,15 +302,13 @@ def build_payload() -> dict:
             "leaderPoints": leader["totalPoints"],
             "riserNames": risers,
             "riserPoints": round(riser_value, 1),
-            "riserMatch": (
-                f"{last_match['homeTeam']} - {last_match['awayTeam']}" if last_match else ""
-            ),
+            "riserRound": current_round_name or "",
             "finishedMatches": finished_matches,
             "totalMatches": total_matches,
             "goalCount": goal_count,
         },
         "scoringRules": SCORING_RULES,
-        "upcomingMatches": upcoming_matches,
+        "matchesByRound": matches_by_round,
         "liveMatchId": live_match["matchId"] if live_match else None,
         "participantDetails": participant_details,
     }
@@ -306,10 +330,11 @@ def main() -> None:
             "-- did the file structure change?"
         )
     DASHBOARD_FILE.write_text(new_html, encoding="utf-8")
+    total_view_matches = sum(len(g["matches"]) for g in payload["matchesByRound"])
     print(
         f"Updated {DASHBOARD_FILE} with fresh data "
         f"({len(payload['series'])} participants, {len(payload['matches'])} matches, "
-        f"{len(payload['upcomingMatches'])} upcoming)."
+        f"{total_view_matches} in match browser across {len(payload['matchesByRound'])} rounds)."
     )
 
 
