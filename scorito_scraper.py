@@ -1,15 +1,25 @@
-"""Fetch prediction ("voorspellingen") and result data for an entire Scorito
-pool and save it as structured JSON for a local dashboard to consume.
+"""Fetch prediction ("voorspellingen") and result data for one or more
+Scorito poules (private pools) of the same tournament, and save it as
+structured JSON for a local dashboard to consume.
 
 Endpoints used (reverse-engineered from the Scorito Gamecenter web app):
-- ranking.scorito.com              -> pool participants, per-round scores
+- ranking.scorito.com              -> poule participants, per-round scores
 - football.scorito.com             -> tournament match schema, results, lineups, goals
 - ftm-prediction-query.scorito.com -> each participant's predictions per round
 
-Writes two files:
-- data/voorspellingen.json -> what each participant predicted
-- data/resultaten.json     -> what actually happened (matches, goals, player
-                               directory, per-round scores for a line race)
+A poule (pool) id only selects WHICH roster of participants to rank -- the
+match schema, results, goals, players, and each user's own predictions and
+round scores are all scoped to the market/event (or the user), not the
+poule. So everything except the roster itself is fetched ONCE and shared
+across every poule in pools.json, rather than being re-fetched per poule.
+
+Writes:
+- data/shared.json      -> matches, players, group standings, round scores
+                            (identical for every poule of this tournament)
+- data/predictions.json -> predictions/topscorer/champion picks, for the
+                            UNION of participants across all poules
+- data/pools/{slug}.json -> one file per poule: its own roster (userId,
+                            name, rank, totalPoints within that poule)
 """
 import json
 import logging
@@ -28,9 +38,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("scorito_scraper")
 
-DATA_DIR = Path(__file__).parent / "data"
-PREDICTIONS_FILE = DATA_DIR / "voorspellingen.json"
-RESULTS_FILE = DATA_DIR / "resultaten.json"
+ROOT = Path(__file__).parent
+DATA_DIR = ROOT / "data"
+POOLS_DATA_DIR = DATA_DIR / "pools"
+SHARED_FILE = DATA_DIR / "shared.json"
+PREDICTIONS_FILE = DATA_DIR / "predictions.json"
+POOLS_CONFIG_FILE = ROOT / "pools.json"
 REQUEST_DELAY_SECONDS = 0.3
 
 BROWSER_HEADERS = {
@@ -90,7 +103,6 @@ class Config:
         load_dotenv()
         self.token = os.getenv("SCORITO_BEARER_TOKEN")
         self.market_id = os.getenv("SCORITO_MARKET_ID")
-        self.pool_id = os.getenv("SCORITO_POOL_ID")
         self.event_id = os.getenv("SCORITO_EVENT_ID")
         self.round_id_offset = int(os.getenv("SCORITO_ROUND_ID_OFFSET", "7161"))
         self.topscorer_id_offset = int(os.getenv("SCORITO_TOPSCORER_ID_OFFSET", "457"))
@@ -100,7 +112,6 @@ class Config:
             for name, value in [
                 ("SCORITO_BEARER_TOKEN", self.token),
                 ("SCORITO_MARKET_ID", self.market_id),
-                ("SCORITO_POOL_ID", self.pool_id),
                 ("SCORITO_EVENT_ID", self.event_id),
             ]
             if not value
@@ -119,22 +130,53 @@ class Config:
         return headers
 
 
-def get_json(url: str, headers: dict):
-    response = requests.get(url, headers=headers, timeout=30)
-
-    if response.status_code == 401:
-        log.error(
-            "401 Unauthorized on %s: the Bearer token has expired or is invalid. "
-            "Grab a fresh token from DevTools and update your .env file.",
-            url,
-        )
+def load_pools() -> list[dict]:
+    """Every poule (Scorito's private pool) this dashboard tracks -- see
+    pools.json. Each needs only a slug (used as a stable id/URL key), a
+    display name, and its Scorito pool id."""
+    with POOLS_CONFIG_FILE.open(encoding="utf-8") as f:
+        pools = json.load(f)
+    missing = [p["slug"] for p in pools if not p.get("poolId")]
+    if missing or not pools:
+        log.error("pools.json is missing or has entries without a poolId: %s", pools)
         sys.exit(1)
+    return pools
 
-    response.raise_for_status()
-    time.sleep(REQUEST_DELAY_SECONDS)
 
-    body = response.json()
-    return body.get("Content", body.get("content", []))
+MAX_RETRIES = 3
+
+
+def get_json(url: str, headers: dict):
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+        except requests.exceptions.RequestException as exc:
+            # Scrapes now run 50+ unique users over many minutes -- a
+            # transient connection reset shouldn't blow away that whole
+            # run, so retry a couple of times with backoff before giving up.
+            if attempt == MAX_RETRIES:
+                raise
+            wait = REQUEST_DELAY_SECONDS * (2**attempt)
+            log.warning(
+                "Request failed (%s), retrying in %.1fs (attempt %d/%d): %s",
+                exc, wait, attempt, MAX_RETRIES, url,
+            )
+            time.sleep(wait)
+            continue
+
+        if response.status_code == 401:
+            log.error(
+                "401 Unauthorized on %s: the Bearer token has expired or is invalid. "
+                "Grab a fresh token from DevTools and update your .env file.",
+                url,
+            )
+            sys.exit(1)
+
+        response.raise_for_status()
+        time.sleep(REQUEST_DELAY_SECONDS)
+
+        body = response.json()
+        return body.get("Content", body.get("content", []))
 
 
 # ftm-prediction-query hosts each user's predictions behind one of several
@@ -191,21 +233,43 @@ def round_label_for_id(cfg: Config, round_id: int) -> str:
     return ROUND_NAMES.get(order, f"Ronde {order}")
 
 
-def fetch_participants(cfg: Config) -> list[dict]:
-    url = f"https://ranking.scorito.com/9/ranking/v2.0/gameranking/getpage/{cfg.pool_id}/0/0"
-    content = get_json(url, cfg.headers())
-    items = content.get("RankingItems", []) if isinstance(content, dict) else []
+def fetch_participants(cfg: Config, pool_id: str) -> list[dict]:
+    """Every participant in a poule, paginated 10-at-a-time.
 
-    participants = [
-        {
-            "userId": item["UserId"],
-            "userName": item["UserName"],
-            "rank": item.get("Rank"),
-            "totalPoints": item.get("TotalPoints"),
-        }
-        for item in items
-    ]
-    log.info("Found %d pool participants", len(participants))
+    The endpoint is getpage/{poolId}/{selectedRankType}/{pageIndex} -- the
+    "0" right after the pool id is NOT a page index (a stray easy
+    assumption, since it happens to also accept 0/1): it's a rank-type
+    selector (0 = "Totaal", 1 = "Ronde", matching the site's own toggle),
+    confirmed by the 400 error it throws for any other value ("selectedRankType
+    ... is invalid"). The REAL page index is the next segment, still 10 items
+    per page -- confirmed against ParticipantCount (e.g. a 26-person poule
+    needs pages 0/1/2, with page 2 returning the last 6 and page 3 empty).
+    Silently trusting just the first page under-reported every poule with
+    more than 10 members.
+    """
+    participants: list[dict] = []
+    page = 0
+    while True:
+        url = f"https://ranking.scorito.com/9/ranking/v2.0/gameranking/getpage/{pool_id}/0/{page}"
+        content = get_json(url, cfg.headers())
+        items = content.get("RankingItems", []) if isinstance(content, dict) else []
+        if not items:
+            break
+        participants.extend(
+            {
+                "userId": item["UserId"],
+                "userName": item["UserName"],
+                "rank": item.get("Rank"),
+                "totalPoints": item.get("TotalPoints"),
+            }
+            for item in items
+        )
+        expected_total = content.get("ParticipantCount") if isinstance(content, dict) else None
+        if expected_total is not None and len(participants) >= expected_total:
+            break
+        page += 1
+
+    log.info("Found %d participants in poule %s", len(participants), pool_id)
     return participants
 
 
@@ -509,24 +573,45 @@ def save(data: dict, output_path: Path) -> None:
 
 def main() -> None:
     cfg = Config()
+    pools = load_pools()
 
     try:
-        participants = fetch_participants(cfg)
+        # 1. Each poule's own roster -- the only thing that's actually
+        # poule-specific. Save these first so a later failure still leaves
+        # useful per-poule output.
+        rosters: dict[str, list[dict]] = {}
+        for pool in pools:
+            rosters[pool["slug"]] = fetch_participants(cfg, pool["poolId"])
+
+        # 2. Union of every unique participant across all poules -- match
+        # predictions, topscorer picks, champion picks, and round scores are
+        # all scoped to the user (or market), not the poule, so each unique
+        # user only needs to be fetched once even if they're in several poules.
+        all_participants_by_id: dict[int, dict] = {}
+        for roster in rosters.values():
+            for p in roster:
+                all_participants_by_id.setdefault(p["userId"], p)
+        all_participants = list(all_participants_by_id.values())
+        log.info(
+            "%d unique participants across %d poules", len(all_participants), len(pools)
+        )
+
+        # 3. Tournament-wide data (shared by every poule).
         matches = fetch_match_schema(cfg)
         round_orders = sorted({m["roundOrder"] for m in matches})
         round_ids = sorted({round_id_for_order(cfg, order) for order in round_orders})
 
         version_cache: dict[int, str] = {}
-        predictions = fetch_predictions(cfg, participants, round_orders, version_cache)
+        predictions = fetch_predictions(cfg, all_participants, round_orders, version_cache)
         topscorer_predictions = fetch_topscorer_predictions(
-            cfg, participants, round_orders, version_cache
+            cfg, all_participants, round_orders, version_cache
         )
         champion_predictions = fetch_champion_predictions(
-            cfg, participants, version_cache
+            cfg, all_participants, version_cache
         )
         match_extra, players = fetch_match_details(cfg, round_ids)
         player_categories = fetch_player_positions(cfg)
-        round_scores = fetch_round_scores(cfg, participants, round_orders)
+        round_scores = fetch_round_scores(cfg, all_participants, round_orders)
         group_standings = fetch_group_standings(cfg)
     except requests.exceptions.RequestException as exc:
         log.error("Request failed: %s", exc)
@@ -543,16 +628,20 @@ def main() -> None:
         player["category"] = info.get("category")
         player["enrichedId"] = info.get("enrichedId")
 
-    pool = {
-        "marketId": cfg.market_id,
-        "poolId": cfg.pool_id,
-        "eventId": cfg.event_id,
-    }
+    save(
+        {
+            "marketId": cfg.market_id,
+            "eventId": cfg.event_id,
+            "matches": matches,
+            "players": list(players.values()),
+            "roundScores": round_scores,
+            "groupStandings": group_standings,
+        },
+        SHARED_FILE,
+    )
 
     save(
         {
-            "pool": pool,
-            "participants": participants,
             "predictions": predictions,
             "topScorerPredictions": topscorer_predictions,
             "championPredictions": champion_predictions,
@@ -560,17 +649,18 @@ def main() -> None:
         PREDICTIONS_FILE,
     )
 
-    save(
-        {
-            "pool": pool,
-            "participants": participants,
-            "matches": matches,
-            "players": list(players.values()),
-            "roundScores": round_scores,
-            "groupStandings": group_standings,
-        },
-        RESULTS_FILE,
-    )
+    for pool in pools:
+        save(
+            {
+                "slug": pool["slug"],
+                "name": pool["name"],
+                "poolId": pool["poolId"],
+                "marketId": cfg.market_id,
+                "eventId": cfg.event_id,
+                "participants": rosters[pool["slug"]],
+            },
+            POOLS_DATA_DIR / f"{pool['slug']}.json",
+        )
 
 
 if __name__ == "__main__":

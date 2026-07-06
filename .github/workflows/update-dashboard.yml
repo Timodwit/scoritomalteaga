@@ -28,7 +28,6 @@ jobs:
         env:
           SCORITO_BEARER_TOKEN: ${{ secrets.SCORITO_BEARER_TOKEN }}
           SCORITO_MARKET_ID: ${{ secrets.SCORITO_MARKET_ID }}
-          SCORITO_POOL_ID: ${{ secrets.SCORITO_POOL_ID }}
           SCORITO_EVENT_ID: ${{ secrets.SCORITO_EVENT_ID }}
         run: python scorito_scraper.py
 

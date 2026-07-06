@@ -26,7 +26,11 @@ resolve:
   group's own matches finish (confirmed this bonus is folded into Ronde 3's
   official total, exactly matching direct computation with no gap).
 
-Writes data/computed_scores.json.
+Run standalone (`python compute_scores.py`) to compute and print QA warnings
+for every poule in pools.json, writing each one's payload to
+data/pools/{slug}-computed.json for inspection. build_dashboard.py is the
+normal caller and does not use these files -- it calls build_payload()
+directly per poule.
 """
 import json
 from pathlib import Path
@@ -125,11 +129,17 @@ def compute_group_position_bonus(results: dict, prediction_by_user_match: dict, 
                 m["matchId"]: prediction_by_user_match.get((uid, m["matchId"]))
                 for m in group_matches_list
             }
-            ranked = _rank_teams_by_predictions(teams, group_matches_list, pred_by_match)
             group_bonus = 0
-            for predicted_rank, team_id in enumerate(ranked, 1):
-                if team_to_actual_rank.get(team_id) == predicted_rank:
-                    group_bonus += GROUP_POSITION_BONUS
+            # A participant with zero predictions for this group has no real
+            # signal at all -- every team ties at 0pts/0-0, so the "ranking"
+            # is just whatever arbitrary order the tiebreaker falls back to,
+            # not a real guess. Scoring that would occasionally hand out a
+            # bonus purely by chance to someone who predicted nothing.
+            if any(pred_by_match.values()):
+                ranked = _rank_teams_by_predictions(teams, group_matches_list, pred_by_match)
+                for predicted_rank, team_id in enumerate(ranked, 1):
+                    if team_to_actual_rank.get(team_id) == predicted_rank:
+                        group_bonus += GROUP_POSITION_BONUS
             bonus[(uid, group_num)] = group_bonus
 
     return bonus, final_match_by_group
@@ -210,13 +220,16 @@ def _rank_teams_by_predictions(teams: set, matches: list[dict], pred_by_match: d
     return ranked
 
 
-def build_payload() -> dict:
-    with open(DATA_DIR / "resultaten.json", encoding="utf-8") as f:
-        results = json.load(f)
-    with open(DATA_DIR / "voorspellingen.json", encoding="utf-8") as f:
-        preds = json.load(f)
+def build_payload(participants: list[dict], results: dict, preds: dict) -> dict:
+    """Compute one poule's scoring payload.
 
-    participants = results["participants"]
+    `participants` is that poule's own roster; `results` (shared tournament
+    data: matches/players/groupStandings/roundScores) and `preds`
+    (predictions/topscorer/champion picks, for every participant across
+    every poule) are identical for every poule of the same tournament, so
+    the caller loads them once and passes them in rather than this function
+    reading fixed files itself.
+    """
     matches = [m for m in results["matches"] if m["status"] == 2]
     matches.sort(key=lambda m: m["matchDate"])
 
@@ -239,11 +252,12 @@ def build_payload() -> dict:
         c["userId"]: c["teamId"] for c in preds.get("championPredictions", [])
     }
 
-    official_round_points = {
-        p["userId"]: {} for p in participants
-    }
+    # roundScores covers every unique participant across ALL poules (shared
+    # data), not just this poule's own roster, so build this from whichever
+    # userIds actually appear rather than pre-seeding just this poule's own.
+    official_round_points: dict[int, dict[str, int]] = {}
     for s in results["roundScores"]:
-        official_round_points[s["userId"]][s["roundName"]] = s["points"]
+        official_round_points.setdefault(s["userId"], {})[s["roundName"]] = s["points"]
 
     # 1. raw match-only points (winner/exact), computed directly from the
     # pool's own scoring rules -- no calibration needed. Verified empirically
@@ -363,7 +377,7 @@ def build_payload() -> dict:
                 f"vs Scorito's official total {s['totalPoints']} (gap {gap:+d})"
             )
         for round_name, round_matches in _matches_by_round(matches).items():
-            official_total = official_round_points[uid].get(round_name)
+            official_total = official_round_points.get(uid, {}).get(round_name)
             if official_total is None:
                 continue
             computed_round_total = sum(
@@ -393,7 +407,6 @@ def build_payload() -> dict:
     ]
 
     return {
-        "pool": results["pool"],
         "matches": match_index,
         "series": series,
         "notes": (
@@ -408,14 +421,25 @@ def build_payload() -> dict:
 
 
 def main() -> None:
-    payload = build_payload()
-    out_path = DATA_DIR / "computed_scores.json"
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    print(
-        f"Wrote {out_path} ({len(payload['matches'])} matches, "
-        f"{len(payload['series'])} participants)"
-    )
+    with open(DATA_DIR / "shared.json", encoding="utf-8") as f:
+        shared = json.load(f)
+    with open(DATA_DIR / "predictions.json", encoding="utf-8") as f:
+        preds = json.load(f)
+    with open(ROOT / "pools.json", encoding="utf-8") as f:
+        pools = json.load(f)
+
+    for pool in pools:
+        with open(DATA_DIR / "pools" / f"{pool['slug']}.json", encoding="utf-8") as f:
+            pool_data = json.load(f)
+        print(f"=== {pool['name']} ({pool['slug']}) ===")
+        payload = build_payload(pool_data["participants"], shared, preds)
+        out_path = DATA_DIR / "pools" / f"{pool['slug']}-computed.json"
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(
+            f"Wrote {out_path} ({len(payload['matches'])} matches, "
+            f"{len(payload['series'])} participants)"
+        )
 
 
 if __name__ == "__main__":

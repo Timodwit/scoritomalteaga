@@ -1,10 +1,13 @@
 """Regenerate dashboard.html's embedded data.
 
 Run this after scorito_scraper.py to refresh the standings/line-race
-dashboard with the latest fetched data. Pulls the official leaderboard and
-stat tiles from data/resultaten.json, the per-match line-race series from
-compute_scores.py (recomputed fresh each time), and builds the upcoming/live
-match predictions view plus per-participant prediction history.
+dashboard for every poule in pools.json. Shared tournament data
+(data/shared.json, data/predictions.json) is loaded once; each poule's own
+roster (data/pools/{slug}.json) combines with it to build that poule's own
+payload (leaderboard, line-race series via compute_scores.py, the round-by-
+round match browser, round winners, and per-participant prediction history).
+All poules' payloads are embedded together so the dashboard can switch
+between them client-side without a rebuild.
 """
 import json
 import re
@@ -36,18 +39,19 @@ SCORING_RULES = {
 }
 
 
-def build_payload() -> dict:
-    with open(ROOT / "data" / "resultaten.json", encoding="utf-8") as f:
-        d = json.load(f)
-    with open(ROOT / "data" / "voorspellingen.json", encoding="utf-8") as f:
-        preds = json.load(f)
+def build_pool_payload(pool_meta: dict, roster: list[dict], d: dict, preds: dict) -> dict:
+    """Build one poule's full dashboard payload.
 
-    participants = sorted(d["participants"], key=lambda p: p["totalPoints"], reverse=True)
+    `pool_meta` is that poule's {slug, name, poolId}; `roster` is its own
+    participant list; `d` (shared.json) and `preds` (predictions.json) are
+    identical for every poule of the tournament and are loaded once by the
+    caller.
+    """
+    participants = sorted(roster, key=lambda p: p["totalPoints"], reverse=True)
     for i, p in enumerate(participants, 1):
         p["rank"] = i
-    participant_by_id = {p["userId"]: p for p in participants}
 
-    computed = build_computed_payload()
+    computed = build_computed_payload(participants, d, preds)
     computed_by_user = {s["userId"]: s for s in computed["series"]}
 
     series = []
@@ -319,7 +323,7 @@ def build_payload() -> dict:
         }
 
     return {
-        "pool": d["pool"],
+        "pool": pool_meta,
         "matches": computed["matches"],
         "series": series,
         "stats": {
@@ -341,7 +345,34 @@ def build_payload() -> dict:
 
 
 def main() -> None:
-    payload = build_payload()
+    with open(ROOT / "data" / "shared.json", encoding="utf-8") as f:
+        shared = json.load(f)
+    with open(ROOT / "data" / "predictions.json", encoding="utf-8") as f:
+        preds = json.load(f)
+    with open(ROOT / "pools.json", encoding="utf-8") as f:
+        pools_config = json.load(f)
+
+    pools_payload = {}
+    pool_order = []
+    for pool in pools_config:
+        with open(ROOT / "data" / "pools" / f"{pool['slug']}.json", encoding="utf-8") as f:
+            pool_data = json.load(f)
+        pool_meta = {"slug": pool["slug"], "name": pool["name"], "poolId": pool["poolId"]}
+        pools_payload[pool["slug"]] = build_pool_payload(
+            pool_meta, pool_data["participants"], shared, preds
+        )
+        pool_order.append(pool_meta)
+        print(
+            f"Built {pool['name']} ({pool['slug']}): "
+            f"{len(pools_payload[pool['slug']]['series'])} participants, "
+            f"{len(pools_payload[pool['slug']]['matches'])} matches"
+        )
+
+    payload = {
+        "pools": pools_payload,
+        "poolOrder": pool_order,
+        "defaultPool": pool_order[0]["slug"] if pool_order else None,
+    }
     payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
 
     html = DASHBOARD_FILE.read_text(encoding="utf-8")
@@ -356,12 +387,7 @@ def main() -> None:
             "-- did the file structure change?"
         )
     DASHBOARD_FILE.write_text(new_html, encoding="utf-8")
-    total_view_matches = sum(len(g["matches"]) for g in payload["matchesByRound"])
-    print(
-        f"Updated {DASHBOARD_FILE} with fresh data "
-        f"({len(payload['series'])} participants, {len(payload['matches'])} matches, "
-        f"{total_view_matches} in match browser across {len(payload['matchesByRound'])} rounds)."
-    )
+    print(f"Updated {DASHBOARD_FILE} with {len(pool_order)} poules.")
 
 
 if __name__ == "__main__":
