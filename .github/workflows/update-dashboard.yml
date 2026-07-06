@@ -2,11 +2,24 @@ name: Update dashboard
 
 on:
   schedule:
-    # Every 15 minutes, offset from :00/:15/:30/:45 -- GitHub's own docs warn
-    # those exact marks see the heaviest queueing/delay since everyone's cron
-    # jobs fire at once. A few minutes off that avoids most of the backlog.
-    - cron: "6,21,36,51 * * * *"
+    # A full scrape now covers every unique participant across all poules in
+    # pools.json (50+ people as of the multi-poule rollout) instead of just
+    # one poule's ~10, so a run takes over an hour instead of ~10 minutes.
+    # Every 15 minutes would just queue up runs faster than they finish, so
+    # this now fires every 2 hours -- still offset from the exact hour mark
+    # per GitHub's own congestion guidance (everyone's cron jobs fire right
+    # on :00, so a few minutes off avoids most of that backlog).
+    - cron: "6 */2 * * *"
   workflow_dispatch: {} # lets you trigger a run manually from the Actions tab
+
+# A run can now take well over an hour, so without this a new scheduled
+# trigger could start before the previous run finishes and both would try
+# to commit/push at once (the second push gets rejected as non-fast-forward).
+# Queue instead of running in parallel -- cancel-in-progress stays false so
+# a long scrape already underway is never killed mid-way by the next tick.
+concurrency:
+  group: update-dashboard
+  cancel-in-progress: false
 
 permissions:
   contents: write
