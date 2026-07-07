@@ -1,4 +1,4 @@
-"""Regenerate dashboard.html's embedded data.
+"""Regenerate dashboard-data.json, the data file dashboard.html fetches.
 
 Run this after scorito_scraper.py to refresh the standings/line-race
 dashboard for every poule in pools.json. Shared tournament data
@@ -6,11 +6,15 @@ dashboard for every poule in pools.json. Shared tournament data
 roster (data/pools/{slug}.json) combines with it to build that poule's own
 payload (leaderboard, line-race series via compute_scores.py, the round-by-
 round match browser, round winners, and per-participant prediction history).
-All poules' payloads are embedded together so the dashboard can switch
-between them client-side without a rebuild.
+All poules' payloads land in one file so the dashboard can switch between
+them client-side without a rebuild.
+
+dashboard-data.json is committed and fetched by dashboard.html at runtime
+(from raw.githubusercontent.com) instead of being embedded in the HTML --
+that way the frequent data-only commits never need a Netlify redeploy of
+the site itself. See netlify.toml's build.ignore rule.
 """
 import json
-import re
 from pathlib import Path
 
 from compute_scores import build_payload as build_computed_payload
@@ -25,7 +29,7 @@ ROUND_ORDER = [
 ]
 
 ROOT = Path(__file__).parent
-DASHBOARD_FILE = ROOT / "dashboard.html"
+DATA_FILE = ROOT / "dashboard-data.json"
 
 SCORING_RULES = {
     "groupStage": {"winner": 30, "exactScore": 45, "topscorer": {"defenderKeeper": 32, "midfielder": 16, "attacker": 8}},
@@ -389,21 +393,8 @@ def main() -> None:
         "poolOrder": pool_order,
         "defaultPool": pool_order[0]["slug"] if pool_order else None,
     }
-    payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
-
-    html = DASHBOARD_FILE.read_text(encoding="utf-8")
-    pattern = re.compile(
-        r'(<script id="dashboard-data" type="application/json">\n).*?(\n</script>)',
-        re.S,
-    )
-    new_html, count = pattern.subn(lambda m: m.group(1) + payload_json + m.group(2), html)
-    if count != 1:
-        raise RuntimeError(
-            "Could not find the dashboard-data script block in dashboard.html "
-            "-- did the file structure change?"
-        )
-    DASHBOARD_FILE.write_text(new_html, encoding="utf-8")
-    print(f"Updated {DASHBOARD_FILE} with {len(pool_order)} poules.")
+    DATA_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Updated {DATA_FILE} with {len(pool_order)} poules.")
 
 
 if __name__ == "__main__":

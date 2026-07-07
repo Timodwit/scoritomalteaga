@@ -1,0 +1,8 @@
+[build]
+  # dashboard-data.json is committed on every scrape tick and every goal
+  # scored during a live match -- often. dashboard.html now fetches that
+  # data client-side (from raw.githubusercontent.com) instead of embedding
+  # it, so those commits don't need a new deploy of the site at all. Skip
+  # the build when the only thing that changed is the data file; a real
+  # deploy still runs whenever dashboard.html/build_dashboard.py/etc change.
+  ignore = "git diff --quiet $CACHED_COMMIT_REF $COMMIT_REF -- . ':!dashboard-data.json'"

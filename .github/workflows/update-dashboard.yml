@@ -46,18 +46,18 @@ jobs:
           SCORITO_EVENT_ID: ${{ secrets.SCORITO_EVENT_ID }}
         run: python scorito_scraper.py
 
-      - name: Rebuild dashboard.html
+      - name: Rebuild dashboard-data.json
         run: python build_dashboard.py
 
       - name: Commit and push if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add dashboard.html
+          git add dashboard-data.json
           if git diff --cached --quiet; then
-            echo "No changes to dashboard.html -- skipping commit."
+            echo "No changes to dashboard-data.json -- skipping commit."
           else
-            git commit -m "Auto-update dashboard $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git commit -m "Auto-update dashboard data $(date -u +'%Y-%m-%d %H:%M UTC')"
             git push
           fi
 
@@ -70,8 +70,11 @@ jobs:
           # While a match is in progress (kickoff passed, Scorito hasn't
           # marked it finished), refresh just the live rounds' scores/goals
           # every ~75s -- a handful of requests, not a full scrape -- and
-          # commit only when the dashboard actually changed. Goals are rare,
-          # so Netlify deploys roughly once per goal, not once per minute.
+          # commit only when the dashboard data actually changed. Goals are
+          # rare, and dashboard-data.json commits are ignored by Netlify's
+          # build (see netlify.toml), so this loop no longer costs any
+          # Netlify deploys at all -- the live page just re-fetches the
+          # data file straight from GitHub.
           #
           # --live-count reads the data files the previous step just wrote,
           # so the common no-live-match case exits here without any network
@@ -88,7 +91,7 @@ jobs:
             sleep 75
             python scorito_scraper.py --live > /dev/null
             python build_dashboard.py
-            git add dashboard.html
+            git add dashboard-data.json
             if git diff --cached --quiet; then
               echo "$(date -u +'%H:%M:%S') no dashboard change"
             else
